@@ -1,0 +1,58 @@
+  # model checkpoints / weights
+  *.ckpt
+  *.pt
+  *.pth
+  *.bin
+  *.safetensors
+  *.onnx
+
+  # checkpoint directories
+  ckpt/
+  ckpts/
+  checkpoint/
+  checkpoints/
+  weights/
+  pretrained/
+  pretrained_models/
+  saved_models/
+  model_checkpoints/
+
+  # training outputs
+  outputs/
+  runs/
+  wandb/
+  logs/
+  lightning_logs/
+
+# large artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+__pycache__/
+*.pyc
+results/
+outputs/
+runs/
+wandb/
+logs/
+lightning_logs/
+
+# large artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+__pycache__/
+  
+*.pyc
+results/
+outputs/
+runs/
+wandb/
+logs/
+lightning_logs/
