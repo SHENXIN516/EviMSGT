@@ -456,6 +456,21 @@ class EvidentialClassificationHead(nn.Module):
             }
         return logits
 
+
+class GlobalGatedAttentionPool(nn.Module):
+    def __init__(self, hidden_dim):
+        super(GlobalGatedAttentionPool, self).__init__()
+        self.gate = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x, batch):
+        if x.numel() == 0:
+            return x.new_zeros((0, x.size(-1)))
+        logits = self.gate(x).clamp(-10.0, 10.0)
+        weights = th.exp(logits)
+        denom = scatter_add(weights, batch, dim=0).clamp_min(1e-6)
+        return scatter_add(x * weights, batch, dim=0) / denom
+
+
 class GraphTransformer(nn.Module):
     """A graph transformer
 	"""
@@ -579,7 +594,13 @@ class MultiScaleGraphTransformer(nn.Module):
             dropout_rate=0.1,
             num_layers=4,
             num_residue_layers=2,
-                use_evidential=False,
+            use_evidential=False,
+            ablation_mode="full",
+            readout_mode="mean_max",
+            use_residue_position=False,
+            use_terminal_flags=False,
+            use_physchem_features=False,
+            max_residue_positions=512,
             **kwargs
     ):
         super(MultiScaleGraphTransformer, self).__init__()
@@ -592,6 +613,18 @@ class MultiScaleGraphTransformer(nn.Module):
         self.num_layers = num_layers
         self.num_residue_layers = num_residue_layers
         self.use_evidential = use_evidential
+        self.ablation_mode = str(ablation_mode).lower().strip()
+        self.readout_mode = str(readout_mode).lower().strip()
+        self.use_residue_position = bool(use_residue_position)
+        self.use_terminal_flags = bool(use_terminal_flags)
+        self.use_physchem_features = bool(use_physchem_features)
+        self.max_residue_positions = int(max_residue_positions)
+
+        valid_modes = {"full", "atom_only", "residue_only", "no_topology", "no_geometry", "no_evidential"}
+        if self.ablation_mode not in valid_modes:
+            raise ValueError(f"Unsupported ablation_mode: {ablation_mode}")
+        if self.ablation_mode == "no_evidential":
+            self.use_evidential = False
 
         self.node_encoder = nn.Linear(in_channels, num_hidden_channels)
         self.edge_encoder = nn.Linear(edge_features, num_hidden_channels)
@@ -643,10 +676,51 @@ class MultiScaleGraphTransformer(nn.Module):
         self.topology_edge_bias = nn.Embedding(3, 1)
         nn.init.zeros_(self.topology_edge_bias.weight)
 
+        if self.use_residue_position:
+            self.residue_position_embedding = nn.Embedding(self.max_residue_positions, num_hidden_channels)
+        else:
+            self.residue_position_embedding = None
+        if self.use_terminal_flags:
+            self.terminal_projection = nn.Linear(2, num_hidden_channels)
+        else:
+            self.terminal_projection = None
+        if self.use_physchem_features:
+            physchem = th.tensor([
+                # hydrophobic, positive, negative, polar, aromatic, special
+                [0, 0, 0, 0, 0, 0],  # A
+                [0, 0, 0, 0, 0, 1],  # C
+                [0, 0, 1, 1, 0, 0],  # D
+                [0, 0, 1, 1, 0, 0],  # E
+                [1, 0, 0, 0, 1, 0],  # F
+                [0, 0, 0, 0, 0, 1],  # G
+                [0, 1, 0, 1, 1, 0],  # H
+                [1, 0, 0, 0, 0, 0],  # I
+                [0, 1, 0, 1, 0, 0],  # K
+                [1, 0, 0, 0, 0, 0],  # L
+                [1, 0, 0, 0, 0, 0],  # M
+                [0, 0, 0, 1, 0, 0],  # N
+                [0, 0, 0, 0, 0, 1],  # P
+                [0, 0, 0, 1, 0, 0],  # Q
+                [0, 1, 0, 1, 0, 0],  # R
+                [0, 0, 0, 1, 0, 0],  # S
+                [0, 0, 0, 1, 0, 0],  # T
+                [1, 0, 0, 0, 0, 0],  # V
+                [1, 0, 0, 0, 1, 0],  # W
+                [1, 0, 0, 1, 1, 0],  # Y
+                [0, 0, 0, 0, 0, 0],  # unknown
+            ], dtype=th.float)
+            self.register_buffer("residue_physchem_table", physchem)
+            self.residue_physchem_projection = nn.Linear(physchem.size(1), num_hidden_channels)
+        else:
+            self.register_buffer("residue_physchem_table", th.zeros((0, 0), dtype=th.float))
+            self.residue_physchem_projection = None
+
         self.atom_from_residue = nn.Linear(num_hidden_channels, num_hidden_channels)
         # Gate now sees atom feat, residue message, and relative geometry (dx,dy,dz,||d||).
         self.cross_scale_gate = nn.Linear(num_hidden_channels * 2 + 4, num_hidden_channels)
         self.cross_scale_norm = nn.LayerNorm(num_hidden_channels)
+        self.atom_attention_pool = GlobalGatedAttentionPool(num_hidden_channels)
+        self.residue_attention_pool = GlobalGatedAttentionPool(num_hidden_channels)
         self.readout_layer = nn.Sequential(
             nn.Linear(num_hidden_channels * 4, num_hidden_channels),
             nn.SiLU(),
@@ -693,6 +767,54 @@ class MultiScaleGraphTransformer(nn.Module):
         residue_cnt = scatter_add(ones, atom_to_residue, dim=0, dim_size=num_residues).clamp_min(1.0)
         residue_feats = residue_sum / residue_cnt
         return residue_feats
+
+    def _local_residue_positions(self, residue_batch):
+        positions = th.zeros_like(residue_batch, dtype=th.long)
+        if residue_batch.numel() == 0:
+            return positions
+        num_graphs = int(residue_batch.max().item()) + 1
+        for gid in range(num_graphs):
+            idx = th.where(residue_batch == gid)[0]
+            if idx.numel() > 0:
+                positions[idx] = th.arange(idx.numel(), device=residue_batch.device, dtype=th.long)
+        return positions
+
+    def _terminal_flags(self, residue_batch):
+        flags = th.zeros((residue_batch.size(0), 2), dtype=th.float, device=residue_batch.device)
+        if residue_batch.numel() == 0:
+            return flags
+        num_graphs = int(residue_batch.max().item()) + 1
+        for gid in range(num_graphs):
+            idx = th.where(residue_batch == gid)[0]
+            if idx.numel() > 0:
+                flags[idx[0], 0] = 1.0
+                flags[idx[-1], 1] = 1.0
+        return flags
+
+    def _augment_residue_feats(self, data, residue_feats, residue_batch):
+        if residue_feats.numel() == 0:
+            return residue_feats
+
+        if self.residue_position_embedding is not None:
+            pos = self._local_residue_positions(residue_batch).clamp(max=self.max_residue_positions - 1)
+            residue_feats = residue_feats + self.residue_position_embedding(pos)
+
+        if self.terminal_projection is not None:
+            residue_feats = residue_feats + self.terminal_projection(self._terminal_flags(residue_batch))
+
+        if self.residue_physchem_projection is not None and hasattr(data, 'residue_aa_index') and data.residue_aa_index is not None:
+            aa_idx = data.residue_aa_index.to(device=residue_feats.device, dtype=th.long)
+            if aa_idx.numel() == residue_feats.size(0):
+                aa_idx = aa_idx.clamp(min=0, max=self.residue_physchem_table.size(0) - 1)
+                physchem = self.residue_physchem_table[aa_idx].to(dtype=residue_feats.dtype)
+                residue_feats = residue_feats + self.residue_physchem_projection(physchem)
+
+        return residue_feats
+
+    def _graph_pool(self, feats, batch, pooler):
+        if self.readout_mode == "gated_attention":
+            return th.cat([pooler(feats, batch), global_max_pool(feats, batch)], dim=-1)
+        return th.cat([global_mean_pool(feats, batch), global_max_pool(feats, batch)], dim=-1)
 
     def _relative_atom_residue_geometry(self, data, atom_to_residue):
         # Build per-atom relative coordinates to residue centroid: [dx, dy, dz, ||d||].
@@ -881,7 +1003,11 @@ class MultiScaleGraphTransformer(nn.Module):
         atom_feats, atom_attentions = self._run_atom_encoder(data, return_attention=return_attention)
         atom_to_residue, residue_batch = self._build_residue_index(data, data.batch)
         residue_feats = self._atom_to_residue_pool(atom_feats, atom_to_residue)
-        residue_dist, residue_edge_type = self._build_residue_topology(data, atom_to_residue, residue_batch)
+        residue_feats = self._augment_residue_feats(data, residue_feats, residue_batch)
+        if self.ablation_mode == "no_topology":
+            residue_dist, residue_edge_type = None, None
+        else:
+            residue_dist, residue_edge_type = self._build_residue_topology(data, atom_to_residue, residue_batch)
         residue_context, residue_attentions = self._run_residue_encoder(
             residue_feats,
             residue_batch,
@@ -890,19 +1016,24 @@ class MultiScaleGraphTransformer(nn.Module):
             return_attention=return_attention,
         )
 
-        residue_message = self.atom_from_residue(residue_context[atom_to_residue])
-        rel_geo = self._relative_atom_residue_geometry(data, atom_to_residue)
-        cross_scale_gate = th.sigmoid(self.cross_scale_gate(th.cat([atom_feats, residue_message, rel_geo], dim=-1)))
-        atom_feats = self.cross_scale_norm(atom_feats + cross_scale_gate * residue_message)
+        if self.ablation_mode == "residue_only":
+            atom_feats_for_readout = atom_feats.new_zeros(atom_feats.shape)
+        else:
+            residue_message = self.atom_from_residue(residue_context[atom_to_residue])
+            if self.ablation_mode == "no_geometry":
+                rel_geo = atom_feats.new_zeros((atom_feats.size(0), 4))
+            else:
+                rel_geo = self._relative_atom_residue_geometry(data, atom_to_residue)
+            cross_scale_gate = th.sigmoid(self.cross_scale_gate(th.cat([atom_feats, residue_message, rel_geo], dim=-1)))
+            atom_feats_for_readout = self.cross_scale_norm(atom_feats + cross_scale_gate * residue_message)
 
-        atom_graph = th.cat([
-            global_mean_pool(atom_feats, data.batch),
-            global_max_pool(atom_feats, data.batch),
-        ], dim=-1)
-        residue_graph = th.cat([
-            global_mean_pool(residue_context, residue_batch),
-            global_max_pool(residue_context, residue_batch),
-        ], dim=-1)
+        if self.ablation_mode == "atom_only":
+            residue_context_for_readout = residue_context.new_zeros(residue_context.shape)
+        else:
+            residue_context_for_readout = residue_context
+
+        atom_graph = self._graph_pool(atom_feats_for_readout, data.batch, self.atom_attention_pool)
+        residue_graph = self._graph_pool(residue_context_for_readout, residue_batch, self.residue_attention_pool)
         graph_repr = th.cat([atom_graph, residue_graph], dim=-1)
         if self.use_evidential:
             cls = self.evidential_head(graph_repr, return_dict=return_evidential)
@@ -1019,6 +1150,3 @@ class SubGT(nn.Module):
         cls = self.readout_layer(prop)
 
         return cls
-
-
-

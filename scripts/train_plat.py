@@ -36,6 +36,11 @@ EDGE_FEATURE_NAMES = [
     "ring",
 ]
 
+AA_TO_INDEX = {
+    aa: i
+    for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")
+}
+
 
 def build_model_config(model):
     hidden_dim = int(model.node_encoder.out_features)
@@ -62,6 +67,11 @@ def build_model_config(model):
     if hasattr(model, "num_residue_layers"):
         config["num_residue_layers"] = int(getattr(model, "num_residue_layers"))
     config["use_evidential"] = bool(getattr(model, "use_evidential", False))
+    config["ablation_mode"] = str(getattr(model, "ablation_mode", "full"))
+    config["readout_mode"] = str(getattr(model, "readout_mode", "mean_max"))
+    config["use_residue_position"] = bool(getattr(model, "use_residue_position", False))
+    config["use_terminal_flags"] = bool(getattr(model, "use_terminal_flags", False))
+    config["use_physchem_features"] = bool(getattr(model, "use_physchem_features", False))
     return config
 
 
@@ -714,6 +724,10 @@ def mol_to_graph(smiles, sequence=None, helm=None, num_monomers=None, mapping_mo
             cyclic=cyclic,
             mapping_mode=mapping_mode,
         )
+    fasta_for_residue_features = sequence_fasta if sequence_fasta is not None else smiles_fasta
+    if fasta_for_residue_features is not None:
+        aa_ids = [AA_TO_INDEX.get(aa, 20) for aa in fasta_for_residue_features]
+        data.residue_aa_index = torch.tensor(aa_ids, dtype=torch.long)
     data.pos = build_atom_positions(mol)
     return data
 
@@ -742,7 +756,8 @@ class BBBP_Dataset(Dataset):
         base = os.path.splitext(os.path.basename(csv_path))[0]
         split_tag = split_col if split_col else "random"
         thr_tag = "none" if permeability_threshold is None else str(permeability_threshold).replace(".", "p")
-        cache_name = f"graphs_{base}_{split_tag}_{label_col}_{thr_tag}_{self.mapping_mode}_geomv2.pt"
+        pos_tag = os.getenv("EVIMSGT_POS_MODE", "auto").strip().lower()
+        cache_name = f"graphs_{base}_{split_tag}_{label_col}_{thr_tag}_{self.mapping_mode}_{pos_tag}_geomv2.pt"
         cache_file = os.path.join(self.cache_dir, cache_name)
 
         if os.path.exists(cache_file):

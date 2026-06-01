@@ -62,8 +62,27 @@ def append_csv_row(csv_path: str, header: List[str], row: Dict[str, object]):
         f.write(','.join(values) + '\n')
 
 
-def build_model(model_name: str, use_evidential: bool, in_channels: int = 38, edge_features: int = 6, hidden: int = 256):
+def build_model(
+    model_name: str,
+    use_evidential: bool,
+    in_channels: int = 38,
+    edge_features: int = 6,
+    hidden: int = 256,
+    ablation_mode: str = None,
+    readout_mode: str = None,
+    use_residue_position: bool = None,
+    use_terminal_flags: bool = None,
+    use_physchem_features: bool = None,
+):
     model_name = model_name.lower()
+    ablation_mode = ablation_mode or os.getenv('EVIMSGT_ABLATION_MODE', 'full')
+    readout_mode = readout_mode or os.getenv('EVIMSGT_READOUT_MODE', 'mean_max')
+    if use_residue_position is None:
+        use_residue_position = os.getenv('EVIMSGT_USE_RESIDUE_POSITION', '0').lower() in {'1', 'true', 'yes', 'y'}
+    if use_terminal_flags is None:
+        use_terminal_flags = os.getenv('EVIMSGT_USE_TERMINAL_FLAGS', '0').lower() in {'1', 'true', 'yes', 'y'}
+    if use_physchem_features is None:
+        use_physchem_features = os.getenv('EVIMSGT_USE_PHYSCHEM_FEATURES', '0').lower() in {'1', 'true', 'yes', 'y'}
     if model_name == 'multiscale':
         return MultiScaleGraphTransformer(
             in_channels=in_channels,
@@ -72,6 +91,11 @@ def build_model(model_name: str, use_evidential: bool, in_channels: int = 38, ed
             num_layers=4,
             num_residue_layers=2,
             use_evidential=use_evidential,
+            ablation_mode=ablation_mode,
+            readout_mode=readout_mode,
+            use_residue_position=use_residue_position,
+            use_terminal_flags=use_terminal_flags,
+            use_physchem_features=use_physchem_features,
         )
     if model_name == 'subgt':
         return SubGT(
@@ -315,6 +339,11 @@ def load_model_from_ckpt(ckpt_path: str, device):
             dropout_rate=float(cfg.get('dropout_rate', 0.1)),
             norm_to_apply=str(cfg.get('norm_to_apply', 'batch')),
             use_evidential=use_evidential,
+            ablation_mode=str(cfg.get('ablation_mode', 'full')),
+            readout_mode=str(cfg.get('readout_mode', 'mean_max')),
+            use_residue_position=bool(cfg.get('use_residue_position', False)),
+            use_terminal_flags=bool(cfg.get('use_terminal_flags', False)),
+            use_physchem_features=bool(cfg.get('use_physchem_features', False)),
         )
     elif model_name == 'GraphTransformer':
         model = GraphTransformer(
@@ -350,7 +379,7 @@ def ensemble_eval_for_split(
     model_paths: List[str],
     device,
 ):
-    dataset = Dataset(
+    dataset = BBBP_Dataset(
         csv_path,
         split_col=split_col,
         label_col='label',

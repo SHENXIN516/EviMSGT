@@ -15,12 +15,12 @@ from torch_geometric.data import DataLoader
 
 try:
     from scripts.fasta_to_csv import parse_fasta, assign_random_split
-    from scripts.train_plat import BBBP_Dataset, evidential_loss_from_logits
+    from scripts.train_plat import BBBP_Dataset, build_model_config, evidential_loss_from_logits
     from scripts.train_common import make_plateau_scheduler, run_training_loop
     from scripts.train_5split_ensemble_grid import build_model, compute_metrics_from_probs, predict_probs
 except ModuleNotFoundError:
     from fasta_to_csv import parse_fasta, assign_random_split
-    from train_plat import BBBP_Dataset, evidential_loss_from_logits
+    from train_plat import BBBP_Dataset, build_model_config, evidential_loss_from_logits
     from train_common import make_plateau_scheduler, run_training_loop
     from train_5split_ensemble_grid import build_model, compute_metrics_from_probs, predict_probs
 
@@ -35,6 +35,31 @@ class SplitResult:
     val_metrics: Dict[str, float]
     test_metrics: Dict[str, float]
     independent_metrics: Dict[str, float]
+    independent_test_metrics: Dict[str, float]
+
+
+def read_manifest(path: Path, seed: Optional[int] = None, task: Optional[int] = None) -> List[Dict[str, object]]:
+    rows = []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if seed is not None and "seed" in row and str(row["seed"]) != str(seed):
+                continue
+            if task is not None and "task" in row and str(row["task"]) != str(task):
+                continue
+            rows.append(row)
+    return rows
+
+
+def resolve_manifest_paths(dataset_root: Path, idx: int) -> Tuple[Path, Path]:
+    task_dir = dataset_root / f"task_{idx:02d}"
+    split_manifest = task_dir / f"split_manifest_task_{idx:02d}.csv"
+    independent_manifest = task_dir / f"independent_manifest_task_{idx:02d}.csv"
+    if not split_manifest.exists():
+        raise FileNotFoundError(f"Missing split manifest: {split_manifest}")
+    if not independent_manifest.exists():
+        raise FileNotFoundError(f"Missing independent manifest: {independent_manifest}")
+    return split_manifest, independent_manifest
 
 
 def resolve_fasta(dataset_dir: Path, base: str, idx: int) -> Path:
@@ -65,6 +90,34 @@ def write_csv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def infer_fieldnames(rows: List[Dict[str, object]], preferred: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for name in preferred:
+        if any(name in row for row in rows):
+            out.append(name)
+            seen.add(name)
+    for row in rows:
+        for name in row.keys():
+            if name not in seen:
+                out.append(name)
+                seen.add(name)
+    return out
+
+
+def require_split_rows(rows: List[Dict[str, object]], path: Path, seed: int, idx: int):
+    counts = {"train": 0, "val": 0, "test": 0}
+    for row in rows:
+        split = str(row.get("split", "")).strip().lower()
+        if split in counts:
+            counts[split] += 1
+    missing = [name for name, count in counts.items() if count == 0]
+    if missing:
+        raise ValueError(
+            f"Manifest {path} task={idx} seed={seed} has empty split(s): {', '.join(missing)}"
+        )
 
 
 def make_loaders(dataset: BBBP_Dataset, batch_size: int):
@@ -284,11 +337,7 @@ def train_one_seed(
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "model_config": {
-                "model_name": model_name,
-                "model_class": model.__class__.__name__,
-                "use_evidential": use_evidential,
-            },
+            "model_config": build_model_config(model),
             "split_seed": seed,
             "mapping_mode": mapping_mode,
             "kl_weight": kl_weight,
@@ -316,17 +365,13 @@ def train_one_seed(
     torch.save(
         {
             "model_state_dict": model.state_dict(),
-            "model_config": {
-                "model_name": model_name,
-                "model_class": model.__class__.__name__,
-                "use_evidential": use_evidential,
-            },
+            "model_config": build_model_config(model),
             "split_seed": seed,
             "mapping_mode": mapping_mode,
             "kl_weight": kl_weight,
             "anneal_epochs": anneal_epochs,
             "best_epoch": best_test_epoch,
-            "best_threshold": best_threshold,
+            "best_threshold": best_test_threshold,
             "val_metrics": best_val_metrics,
             "test_metrics": best_test_metrics_best_acc,
         },
@@ -357,7 +402,15 @@ def evaluate_independent(
     use_evidential = bool(cfg.get("use_evidential", False))
     threshold = float(ckpt.get("best_threshold", 0.5))
 
-    model = build_model(model_name, use_evidential=use_evidential).to(device)
+    model = build_model(
+        model_name,
+        use_evidential=use_evidential,
+        ablation_mode=cfg.get("ablation_mode"),
+        readout_mode=cfg.get("readout_mode"),
+        use_residue_position=cfg.get("use_residue_position"),
+        use_terminal_flags=cfg.get("use_terminal_flags"),
+        use_physchem_features=cfg.get("use_physchem_features"),
+    ).to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
 
     dataset, loader = build_independent_loader(independent_csv, mapping_mode, batch_size)
@@ -384,34 +437,75 @@ def workflow_for_attribute(
     kl_weight: float,
     anneal_epochs: int,
     device,
+    manifest_dataset_root: Optional[Path] = None,
 ):
-    pos_path = resolve_fasta(dataset_dir, "Positive", idx)
-    neg_path = resolve_fasta(dataset_dir, "Negative", idx)
-    ind_path = resolve_independent(dataset_dir, idx)
-
-    pos_rows = parse_fasta(pos_path, default_label=1)
-    neg_rows = parse_fasta(neg_path, default_label=0)
-    train_rows = pos_rows + neg_rows
-
-    independent_rows = parse_fasta(ind_path, default_label=None)
-
     attr_dir = out_dir / f"attr_{idx}"
     csv_dir = attr_dir / "csv"
     csv_dir.mkdir(parents=True, exist_ok=True)
 
-    train_csv = csv_dir / f"trainval_{idx}.csv"
-    indep_csv = csv_dir / f"independent_{idx}.csv"
+    source_info: Dict[str, object]
+    if manifest_dataset_root is not None:
+        split_manifest, independent_manifest = resolve_manifest_paths(manifest_dataset_root, idx)
+        source_info = {
+            "dataset_source": "manifest",
+            "split_manifest": str(split_manifest),
+            "independent_manifest": str(independent_manifest),
+        }
+    else:
+        pos_path = resolve_fasta(dataset_dir, "Positive", idx)
+        neg_path = resolve_fasta(dataset_dir, "Negative", idx)
+        ind_path = resolve_independent(dataset_dir, idx)
 
-    write_csv(train_csv, train_rows, ["id", "sequence", "label"])
-    write_csv(indep_csv, independent_rows, ["id", "sequence", "label"])
+        pos_rows = parse_fasta(pos_path, default_label=1)
+        neg_rows = parse_fasta(neg_path, default_label=0)
+        train_rows = pos_rows + neg_rows
+        independent_rows = parse_fasta(ind_path, default_label=None)
+
+        train_csv = csv_dir / f"trainval_{idx}.csv"
+        indep_csv = csv_dir / f"independent_{idx}.csv"
+        write_csv(train_csv, train_rows, ["id", "sequence", "label"])
+        write_csv(indep_csv, independent_rows, ["id", "sequence", "label"])
+        source_info = {
+            "dataset_source": "fasta",
+            "positive": str(pos_path),
+            "negative": str(neg_path),
+            "independent": str(ind_path),
+            "train_csv": str(train_csv),
+            "independent_csv": str(indep_csv),
+        }
 
     split_results: List[SplitResult] = []
 
     for seed in seeds:
-        rows = [dict(r) for r in train_rows]
-        assign_random_split(rows, seed=seed, train_ratio=train_ratio, val_ratio=val_ratio)
-        split_csv = csv_dir / f"trainval_{idx}_seed{seed}.csv"
-        write_csv(split_csv, rows, ["id", "sequence", "label", "split"])
+        if manifest_dataset_root is not None:
+            rows = read_manifest(split_manifest, seed=seed, task=idx)
+            if not rows:
+                raise ValueError(f"No rows found in {split_manifest} for task={idx} seed={seed}")
+            require_split_rows(rows, split_manifest, seed=seed, idx=idx)
+            split_csv = csv_dir / f"trainval_{idx}_seed{seed}.csv"
+            write_csv(
+                split_csv,
+                rows,
+                infer_fieldnames(rows, ["task", "seed", "split", "sample_id", "orig_id", "id", "sequence", "label"]),
+            )
+
+            independent_rows = read_manifest(independent_manifest, seed=seed, task=idx)
+            if not independent_rows:
+                raise ValueError(f"No rows found in {independent_manifest} for task={idx} seed={seed}")
+            indep_csv = csv_dir / f"independent_{idx}_seed{seed}.csv"
+            write_csv(
+                indep_csv,
+                independent_rows,
+                infer_fieldnames(
+                    independent_rows,
+                    ["task", "seed", "split", "sample_id", "orig_id", "id", "sequence", "label"],
+                ),
+            )
+        else:
+            rows = [dict(r) for r in train_rows]
+            assign_random_split(rows, seed=seed, train_ratio=train_ratio, val_ratio=val_ratio)
+            split_csv = csv_dir / f"trainval_{idx}_seed{seed}.csv"
+            write_csv(split_csv, rows, ["id", "sequence", "label", "split"])
 
         ckpt_path, independent_ckpt_path, best_epoch, val_metrics, test_metrics = train_one_seed(
             csv_path=str(split_csv),
@@ -429,6 +523,13 @@ def workflow_for_attribute(
         )
 
         independent_metrics = evaluate_independent(
+            ckpt_path=ckpt_path,
+            independent_csv=str(indep_csv),
+            mapping_mode=mapping_mode,
+            batch_size=batch_size,
+            device=device,
+        )
+        independent_test_metrics = evaluate_independent(
             ckpt_path=independent_ckpt_path,
             independent_csv=str(indep_csv),
             mapping_mode=mapping_mode,
@@ -446,6 +547,7 @@ def workflow_for_attribute(
                 val_metrics=val_metrics,
                 test_metrics=test_metrics,
                 independent_metrics=independent_metrics,
+                independent_test_metrics=independent_test_metrics,
             )
         )
 
@@ -468,6 +570,8 @@ def workflow_for_attribute(
             row[f"test_{k}"] = float(r.test_metrics.get(k, float("nan")))
         for k in ["acc", "auc", "mcc", "se", "sp", "ba"]:
             row[f"ind_{k}"] = float(r.independent_metrics.get(k, float("nan")))
+        for k in ["acc", "auc", "mcc", "se", "sp", "ba"]:
+            row[f"ind_test_{k}"] = float(r.independent_test_metrics.get(k, float("nan")))
         rows_out.append(row)
 
     fieldnames = [
@@ -494,6 +598,12 @@ def workflow_for_attribute(
         "ind_se",
         "ind_sp",
         "ind_ba",
+        "ind_test_acc",
+        "ind_test_auc",
+        "ind_test_mcc",
+        "ind_test_se",
+        "ind_test_sp",
+        "ind_test_ba",
     ]
     write_csv(csv_out, rows_out, fieldnames)
 
@@ -501,11 +611,7 @@ def workflow_for_attribute(
     payload = {
         "attribute": idx,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "positive": str(pos_path),
-        "negative": str(neg_path),
-        "independent": str(ind_path),
-        "train_csv": str(train_csv),
-        "independent_csv": str(indep_csv),
+        **source_info,
         "seeds": seeds,
         "results": [r.__dict__ for r in split_results],
     }
@@ -517,8 +623,9 @@ def workflow_for_attribute(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch workflow: FASTA -> CSV -> 5x random split -> train -> independent eval")
+    parser = argparse.ArgumentParser(description="Batch workflow: FASTA/manifest -> CSV -> train -> independent eval")
     parser.add_argument("--dataset_dir", default="/home/shenxin/EviMSGT/dataset")
+    parser.add_argument("--manifest_dataset_root", default="")
     parser.add_argument("--x_min", type=int, default=1)
     parser.add_argument("--x_max", type=int, default=19)
     parser.add_argument("--seeds", default="10,20,30,40,50")
@@ -533,11 +640,21 @@ def main():
     parser.add_argument("--kl_weight", type=float, default=1e-5)
     parser.add_argument("--anneal_epochs", type=int, default=5)
     parser.add_argument("--pos_mode", default="2d")
+    parser.add_argument("--ablation_mode", default="full")
+    parser.add_argument("--readout_mode", default="mean_max")
+    parser.add_argument("--use_residue_position", default="0")
+    parser.add_argument("--use_terminal_flags", default="0")
+    parser.add_argument("--use_physchem_features", default="0")
     parser.add_argument("--out_dir", default="/home/shenxin/EviMSGT/results/workflow_batch")
     parser.add_argument("--ckpt_dir", default="/home/shenxin/EviMSGT/ckpt/workflow_batch")
     args = parser.parse_args()
 
     os.environ["EVIMSGT_POS_MODE"] = str(args.pos_mode)
+    os.environ["EVIMSGT_ABLATION_MODE"] = str(args.ablation_mode)
+    os.environ["EVIMSGT_READOUT_MODE"] = str(args.readout_mode)
+    os.environ["EVIMSGT_USE_RESIDUE_POSITION"] = str(args.use_residue_position)
+    os.environ["EVIMSGT_USE_TERMINAL_FLAGS"] = str(args.use_terminal_flags)
+    os.environ["EVIMSGT_USE_PHYSCHEM_FEATURES"] = str(args.use_physchem_features)
 
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     use_evidential = str(args.use_evidential).strip().lower() in {"1", "true", "yes", "y"}
@@ -545,6 +662,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     ckpt_dir = Path(args.ckpt_dir)
+    manifest_dataset_root = Path(args.manifest_dataset_root) if str(args.manifest_dataset_root).strip() else None
 
     for idx in range(args.x_min, args.x_max + 1):
         print("=" * 80)
@@ -566,6 +684,7 @@ def main():
             kl_weight=args.kl_weight,
             anneal_epochs=args.anneal_epochs,
             device=device,
+            manifest_dataset_root=manifest_dataset_root,
         )
         print(f"Saved CSV: {csv_out}")
         print(f"Saved JSON: {json_out}")
