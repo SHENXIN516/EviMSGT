@@ -390,14 +390,15 @@ def evaluate_independent(
 ):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt.get("model_config", {})
-    model_name = cfg.get("model_name", "multiscale")
-    model_class = str(cfg.get("model_class", "")).lower()
-    if model_name.lower() not in {"multiscale", "subgt", "graphtransformer"}:
-        if "multiscale" in model_class:
+    model_name = str(cfg.get("model_name", "multiscale"))
+    model_class = str(cfg.get("model_class", model_name)).lower()
+    model_key = model_name.lower()
+    if model_key not in {"multiscale", "subgt", "graphtransformer"}:
+        if "multiscale" in model_key or "multiscale" in model_class:
             model_name = "multiscale"
-        elif "subgt" in model_class:
+        elif "subgt" in model_key or "subgt" in model_class:
             model_name = "subgt"
-        elif "graphtransformer" in model_class:
+        elif "graphtransformer" in model_key or "graphtransformer" in model_class:
             model_name = "graphtransformer"
     use_evidential = bool(cfg.get("use_evidential", False))
     threshold = float(ckpt.get("best_threshold", 0.5))

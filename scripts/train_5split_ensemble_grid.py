@@ -325,10 +325,13 @@ def train_one_split(
 def load_model_from_ckpt(ckpt_path: str, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = ckpt.get('model_config', {})
-    model_name = cfg.get('model_name', 'MultiScaleGraphTransformer')
+    model_name = str(cfg.get('model_name', 'MultiScaleGraphTransformer'))
+    model_class = str(cfg.get('model_class', model_name))
     use_evidential = bool(cfg.get('use_evidential', False))
+    model_key = model_name.lower()
+    class_key = model_class.lower()
 
-    if model_name == 'MultiScaleGraphTransformer':
+    if model_key == 'multiscale' or 'multiscale' in class_key:
         model = MultiScaleGraphTransformer(
             in_channels=int(cfg.get('in_channels', 38)),
             edge_features=int(cfg.get('edge_features', 6)),
@@ -345,7 +348,7 @@ def load_model_from_ckpt(ckpt_path: str, device):
             use_terminal_flags=bool(cfg.get('use_terminal_flags', False)),
             use_physchem_features=bool(cfg.get('use_physchem_features', False)),
         )
-    elif model_name == 'GraphTransformer':
+    elif model_key == 'graphtransformer' or 'graphtransformer' in class_key:
         model = GraphTransformer(
             in_channels=int(cfg.get('in_channels', 38)),
             edge_features=int(cfg.get('edge_features', 6)),

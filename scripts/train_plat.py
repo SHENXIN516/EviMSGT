@@ -43,10 +43,17 @@ AA_TO_INDEX = {
 
 
 def build_model_config(model):
+    model_class = model.__class__.__name__
+    model_name_map = {
+        "MultiScaleGraphTransformer": "multiscale",
+        "GraphTransformer": "graphtransformer",
+        "SubGT": "subgt",
+    }
     hidden_dim = int(model.node_encoder.out_features)
     num_heads = int(getattr(model, "num_attention_heads", 1))
     config = {
-        "model_name": model.__class__.__name__,
+        "model_name": model_name_map.get(model_class, model_class),
+        "model_class": model_class,
         "num_layers": int(getattr(model, "num_layers", len(getattr(model, "gt_block", [])))),
         "hidden_dim": hidden_dim,
         "num_heads": num_heads,
