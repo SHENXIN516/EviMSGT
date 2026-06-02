@@ -51,6 +51,27 @@ def read_manifest(path: Path, seed: Optional[int] = None, task: Optional[int] = 
     return rows
 
 
+def read_independent_manifest(path: Path, task: Optional[int] = None) -> List[Dict[str, object]]:
+    rows = read_manifest(path, seed=None, task=task)
+    deduped = []
+    seen = set()
+    for row in rows:
+        key = (
+            row.get("sample_id", ""),
+            row.get("orig_id", ""),
+            row.get("sequence", ""),
+            row.get("label", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out = dict(row)
+        if "seed" in out:
+            out["seed"] = "all"
+        deduped.append(out)
+    return deduped
+
+
 def resolve_manifest_paths(dataset_root: Path, idx: int) -> Tuple[Path, Path]:
     task_dir = dataset_root / f"task_{idx:02d}"
     split_manifest = task_dir / f"split_manifest_task_{idx:02d}.csv"
@@ -447,10 +468,23 @@ def workflow_for_attribute(
     source_info: Dict[str, object]
     if manifest_dataset_root is not None:
         split_manifest, independent_manifest = resolve_manifest_paths(manifest_dataset_root, idx)
+        independent_rows = read_independent_manifest(independent_manifest, task=idx)
+        if not independent_rows:
+            raise ValueError(f"No independent rows found in {independent_manifest} for task={idx}")
+        indep_csv = csv_dir / f"independent_{idx}.csv"
+        write_csv(
+            indep_csv,
+            independent_rows,
+            infer_fieldnames(
+                independent_rows,
+                ["task", "seed", "split", "sample_id", "orig_id", "id", "sequence", "label"],
+            ),
+        )
         source_info = {
             "dataset_source": "manifest",
             "split_manifest": str(split_manifest),
             "independent_manifest": str(independent_manifest),
+            "independent_csv": str(indep_csv),
         }
     else:
         pos_path = resolve_fasta(dataset_dir, "Positive", idx)
@@ -490,18 +524,6 @@ def workflow_for_attribute(
                 infer_fieldnames(rows, ["task", "seed", "split", "sample_id", "orig_id", "id", "sequence", "label"]),
             )
 
-            independent_rows = read_manifest(independent_manifest, seed=seed, task=idx)
-            if not independent_rows:
-                raise ValueError(f"No rows found in {independent_manifest} for task={idx} seed={seed}")
-            indep_csv = csv_dir / f"independent_{idx}_seed{seed}.csv"
-            write_csv(
-                indep_csv,
-                independent_rows,
-                infer_fieldnames(
-                    independent_rows,
-                    ["task", "seed", "split", "sample_id", "orig_id", "id", "sequence", "label"],
-                ),
-            )
         else:
             rows = [dict(r) for r in train_rows]
             assign_random_split(rows, seed=seed, train_ratio=train_ratio, val_ratio=val_ratio)
