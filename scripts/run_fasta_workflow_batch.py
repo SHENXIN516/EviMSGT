@@ -399,7 +399,7 @@ def train_one_seed(
         ckpt_test_path,
     )
 
-    return ckpt_path, ckpt_test_path, best_epoch, best_val_metrics, best_test_metrics_best_acc
+    return ckpt_path, ckpt_test_path, best_epoch, best_val_metrics, best_test_metrics
 
 
 def evaluate_independent(
