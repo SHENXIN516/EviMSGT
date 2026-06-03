@@ -5,13 +5,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=48:00:00
-#SBATCH --array=1-4%3
+#SBATCH --array=1-3%3
 #SBATCH --output=slurm-representative-%A_%a.out
 #SBATCH --error=slurm-representative-%A_%a.err
 
 set -euo pipefail
 
-TASKS=(4 6 9 12)
+TASKS=(6 9 12)
 
 IDX=$((SLURM_ARRAY_TASK_ID - 1))
 TASK_ID=${TASKS[$IDX]}

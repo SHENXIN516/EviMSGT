@@ -58,4 +58,4 @@ echo "All representative configs finished."
 python scripts/summarize_representative_search.py \
   --search_root results/representative_search \
   --output_dir results/representative_search_summary \
-  --tasks 4,6,9,12
+  --tasks 6,9,12
