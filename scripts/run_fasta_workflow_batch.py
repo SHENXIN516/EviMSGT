@@ -159,7 +159,12 @@ def make_loaders(dataset: BBBP_Dataset, batch_size: int):
     )
 
 
-def compute_class_weights(dataset: BBBP_Dataset) -> Optional[torch.Tensor]:
+def compute_class_weights(dataset: BBBP_Dataset, mode: str = "balanced") -> Optional[torch.Tensor]:
+    mode = str(mode).strip().lower()
+    if mode in {"none", "off", "0", "false", "no"}:
+        return None
+    if mode != "balanced":
+        raise ValueError(f"Unsupported class_weight_mode: {mode}")
     if dataset.splits is None:
         return None
     train_labels = [
@@ -178,6 +183,20 @@ def compute_class_weights(dataset: BBBP_Dataset) -> Optional[torch.Tensor]:
         else:
             weights.append(1.0)
     return torch.tensor(weights, dtype=torch.float)
+
+
+def resolve_selection_metric(name: str) -> str:
+    metric = str(name).strip().lower()
+    aliases = {
+        "balanced_acc": "ba",
+        "balanced_accuracy": "ba",
+        "combo_auc_ba": "combo",
+    }
+    metric = aliases.get(metric, metric)
+    allowed = {"acc", "auc", "mcc", "ba", "f1", "combo"}
+    if metric not in allowed:
+        raise ValueError(f"Unsupported selection_metric: {name}. Choose from {sorted(allowed)}")
+    return metric
 
 
 def find_best_threshold(y_true: np.ndarray, probs: np.ndarray) -> Tuple[float, float]:
@@ -225,7 +244,10 @@ def train_one_seed(
     anneal_epochs: int,
     device,
     ckpt_dir: str,
+    selection_metric: str,
+    class_weight_mode: str,
 ):
+    selection_metric = resolve_selection_metric(selection_metric)
     dataset = BBBP_Dataset(
         csv_path,
         split_col="split",
@@ -236,9 +258,11 @@ def train_one_seed(
     )
     train_loader, val_loader, test_loader = make_loaders(dataset, batch_size)
 
-    class_weights = compute_class_weights(dataset)
+    class_weights = compute_class_weights(dataset, mode=class_weight_mode)
     if class_weights is not None:
         print(f"[seed {seed}] class weights: {class_weights.tolist()}", flush=True)
+    else:
+        print(f"[seed {seed}] class weights: none", flush=True)
 
     model = build_model(model_name, use_evidential=use_evidential).to(device)
     optimizer = Adam(model.parameters(), lr=lr)
@@ -284,14 +308,14 @@ def train_one_seed(
         val_probs, val_y, _ = predict_probs(model, val_loader, device, use_evidential=use_evidential)
         metrics = compute_metrics_from_probs(val_y, val_probs, threshold=fixed_threshold)
         metrics["thr"] = float(fixed_threshold)
-        metrics["combo"] = float(0.5 * metrics.get("auc", float("nan")) + 0.5 * metrics.get("acc", float("nan")))
+        metrics["combo"] = float(0.5 * metrics.get("auc", float("nan")) + 0.5 * metrics.get("ba", float("nan")))
         return metrics
 
     def test_step(epoch):
         test_probs, test_y, _ = predict_probs(model, test_loader, device, use_evidential=use_evidential)
         metrics = compute_metrics_from_probs(test_y, test_probs, threshold=fixed_threshold)
         metrics["thr"] = float(fixed_threshold)
-        metrics["combo"] = float(0.5 * metrics.get("auc", float("nan")) + 0.5 * metrics.get("acc", float("nan")))
+        metrics["combo"] = float(0.5 * metrics.get("auc", float("nan")) + 0.5 * metrics.get("ba", float("nan")))
         return metrics
 
     def _on_best(epoch, train_metrics, eval_metrics):
@@ -334,10 +358,10 @@ def train_one_seed(
         epochs=epochs,
         train_step=train_step,
         eval_steps={"val": val_step, "test": test_step},
-        best_metric=("val", "acc"),
+        best_metric=("val", selection_metric),
         best_mode="max",
         scheduler=scheduler,
-        scheduler_metric=("val", "acc"),
+        scheduler_metric=("val", selection_metric),
         log_every=1,
         log_fn=lambda msg: print(msg, flush=True),
         log_builder=_log_builder,
@@ -361,6 +385,8 @@ def train_one_seed(
             "model_config": build_model_config(model),
             "split_seed": seed,
             "mapping_mode": mapping_mode,
+            "selection_metric": selection_metric,
+            "class_weight_mode": class_weight_mode,
             "kl_weight": kl_weight,
             "anneal_epochs": anneal_epochs,
             "best_epoch": best_epoch,
@@ -389,6 +415,8 @@ def train_one_seed(
             "model_config": build_model_config(model),
             "split_seed": seed,
             "mapping_mode": mapping_mode,
+            "selection_metric": "internal_test_acc",
+            "class_weight_mode": class_weight_mode,
             "kl_weight": kl_weight,
             "anneal_epochs": anneal_epochs,
             "best_epoch": best_test_epoch,
@@ -460,6 +488,8 @@ def workflow_for_attribute(
     anneal_epochs: int,
     device,
     manifest_dataset_root: Optional[Path] = None,
+    selection_metric: str = "acc",
+    class_weight_mode: str = "balanced",
 ):
     attr_dir = out_dir / f"attr_{idx}"
     csv_dir = attr_dir / "csv"
@@ -543,6 +573,8 @@ def workflow_for_attribute(
             anneal_epochs=anneal_epochs,
             device=device,
             ckpt_dir=str(ckpt_dir / f"attr_{idx}"),
+            selection_metric=selection_metric,
+            class_weight_mode=class_weight_mode,
         )
 
         independent_metrics = evaluate_independent(
@@ -662,6 +694,8 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--kl_weight", type=float, default=1e-5)
     parser.add_argument("--anneal_epochs", type=int, default=5)
+    parser.add_argument("--selection_metric", default="acc")
+    parser.add_argument("--class_weight_mode", default="balanced")
     parser.add_argument("--pos_mode", default="2d")
     parser.add_argument("--ablation_mode", default="full")
     parser.add_argument("--readout_mode", default="mean_max")
@@ -708,6 +742,8 @@ def main():
             anneal_epochs=args.anneal_epochs,
             device=device,
             manifest_dataset_root=manifest_dataset_root,
+            selection_metric=args.selection_metric,
+            class_weight_mode=args.class_weight_mode,
         )
         print(f"Saved CSV: {csv_out}")
         print(f"Saved JSON: {json_out}")
