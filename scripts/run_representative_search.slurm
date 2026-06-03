@@ -5,31 +5,21 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=48:00:00
-#SBATCH --array=1-16%3
+#SBATCH --array=1-4%3
 #SBATCH --output=slurm-representative-%A_%a.out
 #SBATCH --error=slurm-representative-%A_%a.err
 
 set -euo pipefail
 
 TASKS=(4 6 9 12)
-CONFIG_NAMES=(
-  evi_combo_weight
-  evi_combo_noweight
-  ce_combo_weight
-  ce_combo_noweight
-)
-USE_EVIDENTIAL=(1 1 0 0)
-CLASS_WEIGHT_MODE=(balanced none balanced none)
 
 IDX=$((SLURM_ARRAY_TASK_ID - 1))
-TASK_INDEX=$((IDX % ${#TASKS[@]}))
-CONFIG_INDEX=$((IDX / ${#TASKS[@]}))
+TASK_ID=${TASKS[$IDX]}
 
-TASK_ID=${TASKS[$TASK_INDEX]}
-CONFIG_NAME=${CONFIG_NAMES[$CONFIG_INDEX]}
-EVI=${USE_EVIDENTIAL[$CONFIG_INDEX]}
-CW_MODE=${CLASS_WEIGHT_MODE[$CONFIG_INDEX]}
-
+CONFIG_NAME=${CONFIG_NAME:-evi_combo_weight}
+USE_EVIDENTIAL=${USE_EVIDENTIAL:-1}
+SELECTION_METRIC=${SELECTION_METRIC:-combo}
+CLASS_WEIGHT_MODE=${CLASS_WEIGHT_MODE:-balanced}
 LR=${LR:-5e-4}
 EPOCHS=${EPOCHS:-150}
 BATCH_SIZE=${BATCH_SIZE:-32}
@@ -53,8 +43,9 @@ echo "HOST=$(hostname)"
 echo "DATE=$(date)"
 echo "TASK_ID=${TASK_ID}"
 echo "CONFIG_NAME=${CONFIG_NAME}"
-echo "USE_EVIDENTIAL=${EVI}"
-echo "CLASS_WEIGHT_MODE=${CW_MODE}"
+echo "USE_EVIDENTIAL=${USE_EVIDENTIAL}"
+echo "SELECTION_METRIC=${SELECTION_METRIC}"
+echo "CLASS_WEIGHT_MODE=${CLASS_WEIGHT_MODE}"
 echo "LR=${LR}"
 echo "EPOCHS=${EPOCHS}"
 echo "BATCH_SIZE=${BATCH_SIZE}"
@@ -69,9 +60,9 @@ python scripts/run_fasta_workflow_batch.py \
   --epochs "${EPOCHS}" \
   --batch_size "${BATCH_SIZE}" \
   --lr "${LR}" \
-  --use_evidential "${EVI}" \
-  --selection_metric combo \
-  --class_weight_mode "${CW_MODE}" \
+  --use_evidential "${USE_EVIDENTIAL}" \
+  --selection_metric "${SELECTION_METRIC}" \
+  --class_weight_mode "${CLASS_WEIGHT_MODE}" \
   --pos_mode "${POS_MODE}" \
   --out_dir "results/representative_search/${CONFIG_NAME}" \
   --ckpt_dir "ckpt/representative_search/${CONFIG_NAME}"
