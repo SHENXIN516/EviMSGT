@@ -240,6 +240,8 @@ def train_one_seed(
     batch_size: int,
     epochs: int,
     lr: float,
+    weight_decay: float,
+    dropout: float,
     kl_weight: float,
     anneal_epochs: int,
     device,
@@ -264,8 +266,8 @@ def train_one_seed(
     else:
         print(f"[seed {seed}] class weights: none", flush=True)
 
-    model = build_model(model_name, use_evidential=use_evidential).to(device)
-    optimizer = Adam(model.parameters(), lr=lr)
+    model = build_model(model_name, use_evidential=use_evidential, dropout_rate=dropout).to(device)
+    optimizer = Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = make_plateau_scheduler(optimizer, mode="max", patience=6, factor=0.8)
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device) if class_weights is not None else None)
     fixed_threshold = 0.5
@@ -387,6 +389,9 @@ def train_one_seed(
             "mapping_mode": mapping_mode,
             "selection_metric": selection_metric,
             "class_weight_mode": class_weight_mode,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "dropout": dropout,
             "kl_weight": kl_weight,
             "anneal_epochs": anneal_epochs,
             "best_epoch": best_epoch,
@@ -417,6 +422,9 @@ def train_one_seed(
             "mapping_mode": mapping_mode,
             "selection_metric": "internal_test_acc",
             "class_weight_mode": class_weight_mode,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "dropout": dropout,
             "kl_weight": kl_weight,
             "anneal_epochs": anneal_epochs,
             "best_epoch": best_test_epoch,
@@ -455,6 +463,7 @@ def evaluate_independent(
     model = build_model(
         model_name,
         use_evidential=use_evidential,
+        dropout_rate=float(cfg.get("dropout", cfg.get("dropout_rate", 0.1))),
         ablation_mode=cfg.get("ablation_mode"),
         readout_mode=cfg.get("readout_mode"),
         use_residue_position=cfg.get("use_residue_position"),
@@ -484,6 +493,8 @@ def workflow_for_attribute(
     batch_size: int,
     epochs: int,
     lr: float,
+    weight_decay: float,
+    dropout: float,
     kl_weight: float,
     anneal_epochs: int,
     device,
@@ -569,6 +580,8 @@ def workflow_for_attribute(
             batch_size=batch_size,
             epochs=epochs,
             lr=lr,
+            weight_decay=weight_decay,
+            dropout=dropout,
             kl_weight=kl_weight,
             anneal_epochs=anneal_epochs,
             device=device,
@@ -692,6 +705,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--kl_weight", type=float, default=1e-5)
     parser.add_argument("--anneal_epochs", type=int, default=5)
     parser.add_argument("--selection_metric", default="acc")
@@ -709,6 +724,7 @@ def main():
     os.environ["EVIMSGT_POS_MODE"] = str(args.pos_mode)
     os.environ["EVIMSGT_ABLATION_MODE"] = str(args.ablation_mode)
     os.environ["EVIMSGT_READOUT_MODE"] = str(args.readout_mode)
+    os.environ["EVIMSGT_DROPOUT"] = str(args.dropout)
     os.environ["EVIMSGT_USE_RESIDUE_POSITION"] = str(args.use_residue_position)
     os.environ["EVIMSGT_USE_TERMINAL_FLAGS"] = str(args.use_terminal_flags)
     os.environ["EVIMSGT_USE_PHYSCHEM_FEATURES"] = str(args.use_physchem_features)
@@ -738,6 +754,8 @@ def main():
             batch_size=args.batch_size,
             epochs=args.epochs,
             lr=args.lr,
+            weight_decay=args.weight_decay,
+            dropout=args.dropout,
             kl_weight=args.kl_weight,
             anneal_epochs=args.anneal_epochs,
             device=device,

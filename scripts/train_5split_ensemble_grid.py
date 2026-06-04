@@ -68,6 +68,7 @@ def build_model(
     in_channels: int = 38,
     edge_features: int = 6,
     hidden: int = 256,
+    dropout_rate: float = None,
     ablation_mode: str = None,
     readout_mode: str = None,
     use_residue_position: bool = None,
@@ -77,6 +78,8 @@ def build_model(
     model_name = model_name.lower()
     ablation_mode = ablation_mode or os.getenv('EVIMSGT_ABLATION_MODE', 'full')
     readout_mode = readout_mode or os.getenv('EVIMSGT_READOUT_MODE', 'mean_max')
+    if dropout_rate is None:
+        dropout_rate = float(os.getenv('EVIMSGT_DROPOUT', '0.1'))
     if use_residue_position is None:
         use_residue_position = os.getenv('EVIMSGT_USE_RESIDUE_POSITION', '0').lower() in {'1', 'true', 'yes', 'y'}
     if use_terminal_flags is None:
@@ -90,6 +93,7 @@ def build_model(
             num_hidden_channels=hidden,
             num_layers=4,
             num_residue_layers=2,
+            dropout_rate=dropout_rate,
             use_evidential=use_evidential,
             ablation_mode=ablation_mode,
             readout_mode=readout_mode,
@@ -103,11 +107,13 @@ def build_model(
             edge_features=edge_features,
             num_hidden_channels=hidden,
             num_layers=6,
+            dropout_rate=dropout_rate,
         )
     return GraphTransformer(
         in_channels=in_channels,
         edge_features=edge_features,
         num_hidden_channels=hidden,
+        dropout_rate=dropout_rate,
         use_evidential=use_evidential,
     )
 
@@ -328,6 +334,7 @@ def load_model_from_ckpt(ckpt_path: str, device):
     model_name = str(cfg.get('model_name', 'MultiScaleGraphTransformer'))
     model_class = str(cfg.get('model_class', model_name))
     use_evidential = bool(cfg.get('use_evidential', False))
+    dropout_rate = float(cfg.get('dropout', cfg.get('dropout_rate', 0.1)))
     model_key = model_name.lower()
     class_key = model_class.lower()
 
@@ -339,7 +346,7 @@ def load_model_from_ckpt(ckpt_path: str, device):
             num_layers=int(cfg.get('num_layers', 4)),
             num_residue_layers=int(cfg.get('num_residue_layers', 2)),
             num_attention_heads=int(cfg.get('num_attention_heads', 4)),
-            dropout_rate=float(cfg.get('dropout_rate', 0.1)),
+            dropout_rate=dropout_rate,
             norm_to_apply=str(cfg.get('norm_to_apply', 'batch')),
             use_evidential=use_evidential,
             ablation_mode=str(cfg.get('ablation_mode', 'full')),
@@ -355,7 +362,7 @@ def load_model_from_ckpt(ckpt_path: str, device):
             num_hidden_channels=int(cfg.get('num_hidden_channels', 256)),
             num_layers=int(cfg.get('num_layers', 4)),
             num_attention_heads=int(cfg.get('num_attention_heads', 4)),
-            dropout_rate=float(cfg.get('dropout_rate', 0.1)),
+            dropout_rate=dropout_rate,
             norm_to_apply=str(cfg.get('norm_to_apply', 'batch')),
             use_evidential=use_evidential,
         )
@@ -365,6 +372,7 @@ def load_model_from_ckpt(ckpt_path: str, device):
             edge_features=int(cfg.get('edge_features', 6)),
             num_hidden_channels=int(cfg.get('num_hidden_channels', 256)),
             num_layers=int(cfg.get('num_layers', 6)),
+            dropout_rate=dropout_rate,
         )
         use_evidential = False
 
