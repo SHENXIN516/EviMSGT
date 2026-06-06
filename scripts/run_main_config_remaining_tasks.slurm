@@ -4,16 +4,16 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --time=48:00:00
-#SBATCH --array=1-16%3
+#SBATCH --time=480:00:00
+#SBATCH --array=1-13%3
 #SBATCH --output=slurm-main-config-%A_%a.out
 #SBATCH --error=slurm-main-config-%A_%a.err
 
 set -euo pipefail
 
 # Main fixed configuration selected from the representative CE search.
-# Tasks 6, 9, and 12 were already run in results/ce_hparam_search/lr3e-4_drop0p05_wd1e-5.
-TASKS=(1 2 3 4 5 7 8 10 11 13 14 15 16 17 18 19)
+# Tasks 1, 2, 4, 6, 9, and 12 were already run in results/ce_hparam_search/lr3e-4_drop0p05_wd1e-5.
+TASKS=(3 5 7 8 10 11 13 14 15 16 17 18 19)
 
 IDX=$((SLURM_ARRAY_TASK_ID - 1))
 TASK_ID=${TASKS[$IDX]}
@@ -69,4 +69,3 @@ python scripts/run_fasta_workflow_batch.py \
   --pos_mode "${POS_MODE}" \
   --out_dir "results/ce_hparam_search/${CONFIG_NAME}" \
   --ckpt_dir "ckpt/ce_hparam_search/${CONFIG_NAME}"
-
