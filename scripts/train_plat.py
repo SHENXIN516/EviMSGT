@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import itertools
+import hashlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -760,54 +761,72 @@ class BBBP_Dataset(Dataset):
         self.mapping_mode = mapping_mode
         self.label_source = None
 
+        df = pd.read_csv(self.csv_path)
+        if "type" in df.columns:
+            df = df[df["type"] == "SMILES"].reset_index(drop=True)
+
+        smiles_col = "sequence" if "type" in df.columns and "sequence" in df.columns else (
+            "smiles" if "smiles" in df.columns else "sequence"
+        )
+        sequence_col = "sequence" if "sequence" in df.columns else None
+        helm_col = "helm" if "helm" in df.columns else None
+        num_monomers_col = "num_monomers" if "num_monomers" in df.columns else None
+        split_values = df[split_col].astype(str).tolist() if split_col and split_col in df.columns else None
+
+        smiles = df[smiles_col].astype(str).tolist()
+        if label_col in df.columns:
+            labels = df[label_col].astype(int).tolist()
+            self.label_source = label_col
+        elif permeability_col in df.columns:
+            perm = pd.to_numeric(df[permeability_col], errors="coerce")
+            thr = permeability_threshold
+            if thr is None:
+                thr = float(perm.median())
+            labels = (perm >= thr).astype(int).tolist()
+            self.label_source = f"{permeability_col}>= {thr:.4f}"
+            self.permeability_threshold = thr
+        else:
+            raise ValueError(f"No label column '{label_col}' or permeability column '{permeability_col}' found.")
+
+        # Cache only graph construction, not seed-specific labels/splits.
+        # This lets manifest runs reuse the same RDKit graphs across different seed split CSVs.
         base = os.path.splitext(os.path.basename(csv_path))[0]
-        split_tag = split_col if split_col else "random"
-        thr_tag = "none" if permeability_threshold is None else str(permeability_threshold).replace(".", "p")
+        graph_base = re.sub(r"_seed\d+$", "", base)
         pos_tag = os.getenv("EVIMSGT_POS_MODE", "auto").strip().lower()
-        cache_name = f"graphs_{base}_{split_tag}_{label_col}_{thr_tag}_{self.mapping_mode}_{pos_tag}_geomv2.pt"
+        graph_hasher = hashlib.sha1()
+        for row_idx, smi in enumerate(smiles):
+            seq = df.iloc[row_idx][sequence_col] if sequence_col is not None else ""
+            helm = df.iloc[row_idx][helm_col] if helm_col is not None else ""
+            num_monomers = df.iloc[row_idx][num_monomers_col] if num_monomers_col is not None else ""
+            graph_hasher.update(str(smi).encode("utf-8", errors="ignore"))
+            graph_hasher.update(b"\0")
+            graph_hasher.update(str(seq).encode("utf-8", errors="ignore"))
+            graph_hasher.update(b"\0")
+            graph_hasher.update(str(helm).encode("utf-8", errors="ignore"))
+            graph_hasher.update(b"\0")
+            graph_hasher.update(str(num_monomers).encode("utf-8", errors="ignore"))
+            graph_hasher.update(b"\n")
+        graph_hash = graph_hasher.hexdigest()[:12]
+        cache_name = f"graphs_{graph_base}_{graph_hash}_{self.mapping_mode}_{pos_tag}_geomv3.pt"
         cache_file = os.path.join(self.cache_dir, cache_name)
 
+        data = None
         if os.path.exists(cache_file):
-            print(f"Loading preprocessed data from {cache_file}")
-            data = torch.load(cache_file,weights_only=False)
-            self.smiles = data["smiles"]
-            self.labels = data["labels"]
+            print(f"Loading preprocessed graphs from {cache_file}")
+            data = torch.load(cache_file, weights_only=False)
+
+        if data is not None and "valid_row_indices" in data:
+            valid_row_indices = [int(i) for i in data["valid_row_indices"]]
             self.graphs = data["graphs"]
-            self.splits = data.get("splits", None)
-            self.label_source = data.get("label_source", None)
-            self.permeability_threshold = data.get("permeability_threshold", self.permeability_threshold)
+            self.labels = [labels[i] for i in valid_row_indices]
+            self.smiles = [smiles[i] for i in valid_row_indices]
+            self.splits = [str(split_values[i]) for i in valid_row_indices] if split_values is not None else None
         else:
-            df = pd.read_csv(self.csv_path)
-            if "type" in df.columns:
-                df = df[df["type"] == "SMILES"]
-
-            smiles_col = "sequence" if "type" in df.columns and "sequence" in df.columns else (
-                "smiles" if "smiles" in df.columns else "sequence"
-            )
-            sequence_col = "sequence" if "sequence" in df.columns else None
-            helm_col = "helm" if "helm" in df.columns else None
-            num_monomers_col = "num_monomers" if "num_monomers" in df.columns else None
-            split_values = df[split_col].astype(str).tolist() if split_col and split_col in df.columns else None
-
-            smiles = df[smiles_col].astype(str).tolist()
-            if label_col in df.columns:
-                labels = df[label_col].astype(int).tolist()
-                self.label_source = label_col
-            elif permeability_col in df.columns:
-                perm = pd.to_numeric(df[permeability_col], errors="coerce")
-                thr = permeability_threshold
-                if thr is None:
-                    thr = float(perm.median())
-                labels = (perm >= thr).astype(int).tolist()
-                self.label_source = f"{permeability_col}>= {thr:.4f}"
-                self.permeability_threshold = thr
-            else:
-                raise ValueError(f"No label column '{label_col}' or permeability column '{permeability_col}' found.")
-
             self.graphs = []
             self.labels = []
             self.smiles = []
             self.splits = [] if split_values is not None else None
+            valid_row_indices = []
             total_rows = len(smiles)
             for row_idx, (smi, label) in enumerate(zip(smiles, labels)):
                 seq = df.iloc[row_idx][sequence_col] if sequence_col is not None else None
@@ -824,6 +843,7 @@ class BBBP_Dataset(Dataset):
                     self.graphs.append(g)
                     self.labels.append(label)
                     self.smiles.append(smi)
+                    valid_row_indices.append(row_idx)
                     if self.splits is not None:
                         self.splits.append(str(split_values[row_idx]))
 
@@ -838,11 +858,11 @@ class BBBP_Dataset(Dataset):
             torch.save(
                 {
                     "smiles": self.smiles,
-                    "labels": self.labels,
                     "graphs": self.graphs,
-                    "splits": self.splits,
-                    "label_source": self.label_source,
-                    "permeability_threshold": self.permeability_threshold,
+                    "valid_row_indices": valid_row_indices,
+                    "mapping_mode": self.mapping_mode,
+                    "pos_mode": pos_tag,
+                    "cache_version": "geomv3",
                 },
                 cache_file,
             )
