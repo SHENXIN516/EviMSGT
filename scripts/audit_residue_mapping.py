@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -13,23 +13,50 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.run_fasta_workflow_batch import read_independent_manifest, read_manifest, resolve_manifest_paths
-from scripts.train_plat import mol_to_graph
+from scripts.train_plat import BBBP_Dataset, mol_to_graph
 
 
 def parse_int_list(text: str) -> List[int]:
     return [int(x.strip()) for x in str(text).split(",") if x.strip()]
 
 
-def residue_audit_row(row: Dict[str, object], task_id: int, seed: str, source: str, mapping_mode: str):
+def read_csv(path: Path) -> List[Dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def find_metrics_csv(results_dir: Path, task_id: int) -> Optional[Path]:
+    candidates = [
+        results_dir / ("metrics.csv" if task_id == 1 else f"metrics({task_id}).csv"),
+        results_dir / f"metrics_{task_id:02d}.csv",
+        results_dir / f"task_{task_id:02d}.csv",
+        results_dir / f"task_{task_id}.csv",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def align_dataset_rows(dataset: BBBP_Dataset, raw_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    aligned = []
+    raw_pos = 0
+    for smi in dataset.smiles:
+        matched = {}
+        while raw_pos < len(raw_rows):
+            raw = raw_rows[raw_pos]
+            raw_pos += 1
+            candidate = raw.get("sequence", raw.get("smiles", ""))
+            if str(candidate) == str(smi):
+                matched = raw
+                break
+        aligned.append(matched)
+    return aligned
+
+
+def base_output(row: Dict[str, object], task_id: int, seed: str, source: str) -> Dict[str, object]:
     sequence = str(row.get("sequence", "")).strip().upper()
-    graph = mol_to_graph(
-        sequence,
-        sequence=sequence,
-        helm=row.get("helm"),
-        num_monomers=row.get("num_monomers"),
-        mapping_mode=mapping_mode,
-    )
-    out = {
+    return {
         "task": task_id,
         "seed": seed,
         "source": source,
@@ -50,6 +77,9 @@ def residue_audit_row(row: Dict[str, object], task_id: int, seed: str, source: s
         "atom_per_residue_std": "",
         "merged_or_missing": "",
     }
+
+
+def summarize_graph(out: Dict[str, object], graph):
     if graph is None:
         out["status"] = "invalid_graph"
         return out
@@ -71,6 +101,53 @@ def residue_audit_row(row: Dict[str, object], task_id: int, seed: str, source: s
         out["atom_per_residue_mean"] = float(nonzero_counts.mean())
         out["atom_per_residue_max"] = int(nonzero_counts.max())
         out["atom_per_residue_std"] = float(nonzero_counts.std())
+    return out
+
+
+def residue_audit_row(row: Dict[str, object], task_id: int, seed: str, source: str, mapping_mode: str):
+    sequence = str(row.get("sequence", "")).strip().upper()
+    out = base_output(row, task_id, seed, source)
+    graph = mol_to_graph(
+        sequence,
+        sequence=sequence,
+        helm=row.get("helm"),
+        num_monomers=row.get("num_monomers"),
+        mapping_mode=mapping_mode,
+    )
+    return summarize_graph(out, graph)
+
+
+def cached_dataset_rows(csv_path: Path, task_id: int, seed: str, mapping_mode: str, cache_dir: str) -> List[Dict[str, object]]:
+    dataset = BBBP_Dataset(
+        str(csv_path),
+        cache_dir=cache_dir,
+        split_col="split",
+        label_col="label",
+        mapping_mode=mapping_mode,
+    )
+    raw_rows = read_csv(csv_path)
+    aligned_rows = align_dataset_rows(dataset, raw_rows)
+    rows = []
+    for idx in range(len(dataset)):
+        raw = aligned_rows[idx] if idx < len(aligned_rows) else {}
+        if dataset.splits is not None and idx < len(dataset.splits):
+            raw = dict(raw)
+            raw["split"] = dataset.splits[idx]
+        out = base_output(raw, task_id, seed, "split_csv_cache")
+        rows.append(summarize_graph(out, dataset.get(idx)))
+    return rows
+
+
+def split_csv_by_seed(results_dir: Path, task_id: int) -> Dict[str, Path]:
+    metrics_path = find_metrics_csv(results_dir, task_id)
+    out = {}
+    if metrics_path is None:
+        return out
+    for row in read_csv(metrics_path):
+        seed = str(row.get("seed", "")).strip()
+        split_csv = row.get("split_csv", "")
+        if seed and split_csv and Path(split_csv).exists():
+            out[seed] = Path(split_csv)
     return out
 
 
@@ -121,6 +198,10 @@ def main():
     parser.add_argument("--seeds", default="10")
     parser.add_argument("--mapping_mode", default="helm_force")
     parser.add_argument("--pos_mode", default="zero")
+    parser.add_argument("--results_dir", default="results/ce_hparam_search/lr3e-4_drop0p05_wd1e-5")
+    parser.add_argument("--cache_dir", default=str(ROOT / "dataset"))
+    parser.add_argument("--no_cache_reuse", action="store_true")
+    parser.add_argument("--progress_every", type=int, default=200)
     parser.add_argument("--output_dir", default="results/residue_mapping_audit")
     args = parser.parse_args()
 
@@ -131,12 +212,29 @@ def main():
     rows_out = []
 
     for task_id in tasks:
+        print(f"[task {task_id}] residue mapping audit started", flush=True)
         split_manifest, independent_manifest = resolve_manifest_paths(dataset_root, task_id)
+        cached_split_csvs = {} if args.no_cache_reuse else split_csv_by_seed(Path(args.results_dir), task_id)
         for seed in seeds:
-            for row in read_manifest(split_manifest, seed=int(seed), task=task_id):
+            if seed in cached_split_csvs:
+                print(f"[task {task_id} seed {seed}] loading cached dataset from {cached_split_csvs[seed]}", flush=True)
+                rows_out.extend(cached_dataset_rows(cached_split_csvs[seed], task_id, seed, args.mapping_mode, args.cache_dir))
+                continue
+
+            manifest_rows = read_manifest(split_manifest, seed=int(seed), task=task_id)
+            print(f"[task {task_id} seed {seed}] fallback manifest graph audit: {len(manifest_rows)} rows", flush=True)
+            for i, row in enumerate(manifest_rows, 1):
                 rows_out.append(residue_audit_row(row, task_id, seed, "split_manifest", args.mapping_mode))
-        for row in read_independent_manifest(independent_manifest, task=task_id):
+                if args.progress_every > 0 and i % args.progress_every == 0:
+                    print(f"[task {task_id} seed {seed}] processed {i}/{len(manifest_rows)} split rows", flush=True)
+
+        independent_rows = read_independent_manifest(independent_manifest, task=task_id)
+        print(f"[task {task_id}] independent fallback graph audit: {len(independent_rows)} rows", flush=True)
+        for i, row in enumerate(independent_rows, 1):
             rows_out.append(residue_audit_row(row, task_id, "all", "independent", args.mapping_mode))
+            if args.progress_every > 0 and i % args.progress_every == 0:
+                print(f"[task {task_id}] processed {i}/{len(independent_rows)} independent rows", flush=True)
+        print(f"[task {task_id}] residue mapping audit finished", flush=True)
 
     fieldnames = [
         "task",
