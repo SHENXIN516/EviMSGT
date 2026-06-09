@@ -29,7 +29,7 @@ python scripts/audit_residue_mapping.py \
   --results_dir results/ce_hparam_search/lr3e-4_drop0p05_wd1e-5 \
   --tasks 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 \
   --seeds 10 \
-  --pos_mode zero \
+  --pos_mode auto \
   --output_dir results/residue_mapping_audit
 ```
 
@@ -38,7 +38,7 @@ Outputs:
 - `residue_mapping_audit_by_sample.csv`: sequence length, residue count, atom counts per residue, missing/merged flag.
 - `residue_mapping_audit_summary.csv`: per-task mapping summary.
 
-`--pos_mode zero` is intentional because mapping audit does not need 2D/3D coordinates.
+Use the same `--pos_mode` as the training run if you want to reuse existing graph caches.
 When `--results_dir` contains finished workflow `metrics*.csv`, the split rows are audited from the
 same `split_csv` and graph cache used during training. If no cached split CSV is found, the script
 falls back to manifest rows and prints progress while rebuilding graphs.

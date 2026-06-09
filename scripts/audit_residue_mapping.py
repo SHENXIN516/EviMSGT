@@ -84,6 +84,7 @@ def summarize_graph(out: Dict[str, object], graph):
         out["status"] = "invalid_graph"
         return out
 
+    sequence = str(out.get("sequence", "")).strip().upper()
     atom_residue = graph.atom_residue_index.detach().cpu().numpy().astype(int)
     unique = np.unique(atom_residue)
     residue_count = int(unique.size)
@@ -197,7 +198,7 @@ def main():
     parser.add_argument("--tasks", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19")
     parser.add_argument("--seeds", default="10")
     parser.add_argument("--mapping_mode", default="helm_force")
-    parser.add_argument("--pos_mode", default="zero")
+    parser.add_argument("--pos_mode", default="auto")
     parser.add_argument("--results_dir", default="results/ce_hparam_search/lr3e-4_drop0p05_wd1e-5")
     parser.add_argument("--cache_dir", default=str(ROOT / "dataset"))
     parser.add_argument("--no_cache_reuse", action="store_true")
@@ -206,6 +207,7 @@ def main():
     args = parser.parse_args()
 
     os.environ["EVIMSGT_POS_MODE"] = str(args.pos_mode)
+    print(f"Using EVIMSGT_POS_MODE={args.pos_mode}. For cache reuse, this must match the training run.", flush=True)
     dataset_root = Path(args.dataset_root)
     tasks = parse_int_list(args.tasks)
     seeds = [s.strip() for s in str(args.seeds).split(",") if s.strip()]
@@ -217,7 +219,10 @@ def main():
         cached_split_csvs = {} if args.no_cache_reuse else split_csv_by_seed(Path(args.results_dir), task_id)
         for seed in seeds:
             if seed in cached_split_csvs:
-                print(f"[task {task_id} seed {seed}] loading cached dataset from {cached_split_csvs[seed]}", flush=True)
+                print(
+                    f"[task {task_id} seed {seed}] loading split CSV via BBBP_Dataset: {cached_split_csvs[seed]}",
+                    flush=True,
+                )
                 rows_out.extend(cached_dataset_rows(cached_split_csvs[seed], task_id, seed, args.mapping_mode, args.cache_dir))
                 continue
 
