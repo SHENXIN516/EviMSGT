@@ -40,6 +40,10 @@ wandb/
 logs/
 lightning_logs/
 
+# Slurm runtime logs should stay local to the cluster.
+slurm-*.out
+slurm-*.err
+
 # large artifacts
 *.pt
 *.pth
